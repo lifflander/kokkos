@@ -149,8 +149,10 @@ private:
   struct ACCESSIBLE_TAG {};
   struct INACCESSIBLE_TAG {};
 
-  SmartMemoryAccessor(ACCESSIBLE_TAG, pointer_type* arg_chunks)
+  SmartMemoryAccessor(ACCESSIBLE_TAG, pointer_type* arg_chunks,
+                      const unsigned arg_chunk_max)
     : m_chunks(arg_chunks),
+      m_chunk_max(arg_chunk_max),
       m_valid(true)
   { }
 
@@ -171,7 +173,8 @@ public:
       Kokkos::Impl::MemorySpaceAccess<MemorySpace, Space>::accessible
     >::type* = nullptr
   ) {
-    return SmartMemoryAccessor<Space, ValueType>{ACCESSIBLE_TAG{}, other.m_chunks};
+    return SmartMemoryAccessor<Space, ValueType>{
+      ACCESSIBLE_TAG{}, other.m_chunks, other.m_chunk_max};
   }
 
   template <typename Space>
@@ -193,6 +196,9 @@ public:
         kokkos_malloc<MemorySpace>(label, (sizeof(pointer_type) * (m_chunk_max + 2))));
       m_valid = true;
     }
+    for (unsigned i = 0; i < m_chunk_max + 2; i++) {
+      m_chunks[i] = nullptr;
+    }
   }
 
   void allocate(const std::string& label) {
@@ -209,9 +215,6 @@ public:
     m_track.assign_allocated_record_to_uninitialized(record);
 
     record->m_destroy = destroy_type(label, m_chunks, m_chunk_max, m_chunk_size);
-
-    // Initialize to zero
-    record->m_destroy.construct_shared_allocation();
 
     m_valid = true;
   }
@@ -558,6 +561,7 @@ class DynamicView : public Kokkos::ViewTraits<DataType, P...> {
 
     m_chunks_host = device_accessor::template create_mirror<host_space>(m_chunks);
     m_chunks_host.allocate_mirror_if_not_accessible(arg_label);
+    m_chunks_host.deep_copy_to(m_chunks);
   }
 };
 
