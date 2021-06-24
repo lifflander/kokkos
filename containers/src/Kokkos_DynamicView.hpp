@@ -66,11 +66,14 @@ struct Destroy {
   Destroy& operator=(const Destroy&) = default;
 
   Destroy(std::string label, ValueType** arg_chunk,
-          const unsigned arg_chunk_max, const unsigned arg_chunk_size)
+          const unsigned arg_chunk_max, const unsigned arg_chunk_size,
+	  local_value_type** arg_other)
     : m_label(label),
       m_chunks(arg_chunk),
       m_chunk_max(arg_chunk_max),
-      m_chunk_size(arg_chunk_size) {}
+      m_chunk_size(arg_chunk_size),
+      m_other(arg_other)
+  {}
 
   // Initialize or destroy array of chunk pointers.
   // Two entries beyond the max chunks are allocation counters.
@@ -83,22 +86,21 @@ struct Destroy {
   }
 
   void execute(bool arg_destroy) {
-    using Range = Kokkos::RangePolicy<typename HostSpace::execution_space>;
-
-    Kokkos::Impl::ParallelFor<Destroy, Range> closure(
-      *this,
-      Range(0, m_chunk_max + 2));  // Add 2 to 'destroy' extra slots storing
-    // num_chunks and extent; previously + 1
-
-    closure.execute();
-
-    typename MemorySpace::execution_space().fence();
+    for (unsigned i = 0; i < m_chunk_max; i++) {
+      (*this)(i);
+    }
+    if (m_other != nullptr) {
+      //printf("deallocating device memory %s\n", m_label.c_str());
+      MemorySpace().deallocate(
+        m_label.c_str(), m_other, (sizeof(local_value_type*) * (m_chunk_max + 2)));
+    }
   }
 
   void destroy_shared_allocation() { execute(true); }
 
   std::string m_label;
   local_value_type** m_chunks;
+  local_value_type** m_other = nullptr;
   unsigned m_chunk_max;
   unsigned m_chunk_size;
 };
@@ -188,8 +190,12 @@ public:
 public:
   void allocate_device(const std::string& label) {
     if (m_chunks == nullptr) {
-      m_chunks = static_cast<pointer_type*>(
-        kokkos_malloc<MemorySpace>(label, (sizeof(pointer_type) * (m_chunk_max + 2))));
+      //printf("allocating device memory %s\n", label.c_str());
+      m_chunks = reinterpret_cast<pointer_type*>(
+        MemorySpace().allocate(label.c_str(), (sizeof(pointer_type) * (m_chunk_max + 2))));
+      typename MemorySpace::execution_space().fence();
+      // m_chunks = static_cast<pointer_type*>(
+      //   kokkos_malloc<MemorySpace>(label, (sizeof(pointer_type) * (m_chunk_max + 2))));
     }
   }
 
@@ -200,8 +206,9 @@ public:
     m_valid = true;
   }
 
-  void allocate(const std::string& label) {
-    using destroy_type = Destroy<MemorySpace, ValueType>;
+  template <typename Space>
+  void allocate(const std::string& label, pointer_type* other) {
+    using destroy_type = Destroy<Space, ValueType>;
     using record_type  = Kokkos::Impl::SharedAllocationRecord<MemorySpace, destroy_type>;
 
     // Allocate + 2 extra slots so that *m_chunk[m_chunk_max] ==
@@ -213,15 +220,17 @@ public:
     m_chunks = static_cast<pointer_type*>(record->data());
     m_track.assign_allocated_record_to_uninitialized(record);
 
-    record->m_destroy = destroy_type(label, m_chunks, m_chunk_max, m_chunk_size);
+    record->m_destroy = destroy_type(label, m_chunks, m_chunk_max, m_chunk_size, other);
   }
+
+  pointer_type* get_ptr() const { return m_chunks; }
 
   template <typename Space>
   typename std::enable_if<
     not Kokkos::Impl::MemorySpaceAccess<MemorySpace, Space>::accessible
   >::type
   deep_copy_to(SmartMemoryAccessor<Space, ValueType> const& other) {
-    Kokkos::Impl::DeepCopy<MemorySpace, Space>(other.m_chunks, m_chunks, m_chunk_max+2);
+    Kokkos::Impl::DeepCopy<Space, MemorySpace>(other.m_chunks, m_chunks, sizeof(pointer_type)*(m_chunk_max+2));
   }
 
   template <typename Space>
@@ -350,7 +359,7 @@ class DynamicView : public Kokkos::ViewTraits<DataType, P...> {
 
   KOKKOS_INLINE_FUNCTION
   size_t allocation_extent() const noexcept {
-    uintptr_t n = *reinterpret_cast<const uintptr_t*>(m_chunks + m_chunk_max);
+    uintptr_t n = *reinterpret_cast<const uintptr_t*>(m_chunks_host + m_chunk_max);
     return (n << m_chunk_shift);
   }
 
@@ -360,7 +369,7 @@ class DynamicView : public Kokkos::ViewTraits<DataType, P...> {
   KOKKOS_INLINE_FUNCTION
   size_t size() const noexcept {
     size_t extent_0 =
-        *reinterpret_cast<const size_t*>(m_chunks + m_chunk_max + 1);
+        *reinterpret_cast<const size_t*>(m_chunks_host + m_chunk_max + 1);
     return extent_0;
   }
 
@@ -488,12 +497,12 @@ class DynamicView : public Kokkos::ViewTraits<DataType, P...> {
     } else {
       while (NC + 1 <= *pc) {
         --*pc;
-        device_space().deallocate(_label.c_str(), m_chunks[*pc],
+        device_space().deallocate(_label.c_str(), m_chunks_host[*pc],
                                   sizeof(local_value_type) << m_chunk_shift);
         m_chunks_host[*pc] = nullptr;
       }
     }
-    // *m_chunks[m_chunk_max+1] stores the 'extent' requested by resize
+    // *m_chunks_host[m_chunk_max+1] stores the 'extent' requested by resize
     *(pc + 1) = n;
 
     m_chunks_host.deep_copy_to(m_chunks);
@@ -553,16 +562,17 @@ class DynamicView : public Kokkos::ViewTraits<DataType, P...> {
         ,
         m_chunk_size(2 << (m_chunk_shift - 1))
   {
+    //printf("m_chunk_max=%u, m_chunk_size=%u\n", m_chunk_max, m_chunk_size);
     m_chunks = device_accessor(m_chunk_max, m_chunk_size);
 
     if (m_chunks.template is_accessible_from<host_space>) {
-      m_chunks.allocate(arg_label);
+      m_chunks.template allocate<device_space>(arg_label, nullptr);
       m_chunks.initialize();
       m_chunks_host = device_accessor::template create_mirror<host_space>(m_chunks);
     } else {
       m_chunks.allocate_device(arg_label);
       m_chunks_host = device_accessor::template create_mirror<host_space>(m_chunks);
-      m_chunks_host.allocate(arg_label);
+      m_chunks_host.template allocate<device_space>(arg_label, m_chunks.get_ptr());
       m_chunks_host.initialize();
       m_chunks_host.deep_copy_to(m_chunks);
     }
