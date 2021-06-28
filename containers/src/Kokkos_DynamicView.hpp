@@ -57,7 +57,7 @@ namespace Impl {
 
 template <typename MemorySpace, typename ValueType>
 struct Destroy {
-  using local_value_type = ValueType;
+  using value_type = ValueType;
 
   Destroy()               = default;
   Destroy(Destroy&&)      = default;
@@ -67,40 +67,34 @@ struct Destroy {
 
   Destroy(std::string label, ValueType** arg_chunk,
           const unsigned arg_chunk_max, const unsigned arg_chunk_size,
-	  local_value_type** arg_other)
+          value_type** arg_linked)
     : m_label(label),
       m_chunks(arg_chunk),
       m_chunk_max(arg_chunk_max),
       m_chunk_size(arg_chunk_size),
-      m_other(arg_other)
+      m_linked(arg_linked)
   {}
 
-  // Initialize or destroy array of chunk pointers.
-  // Two entries beyond the max chunks are allocation counters.
-  inline void operator()(unsigned i) const {
-    if (i < m_chunk_max && nullptr != m_chunks[i]) {
+  void execute(bool arg_destroy) {
+    // Destroy the array of chunk pointers.
+    // Two entries beyond the max chunks are allocation counters.
+    for (unsigned i = 0; i < m_chunk_max; i++) {
       MemorySpace().deallocate(
         m_label.c_str(), m_chunks[i],
-        sizeof(local_value_type) * m_chunk_size);
+        sizeof(value_type) * m_chunk_size);
     }
-  }
-
-  void execute(bool arg_destroy) {
-    for (unsigned i = 0; i < m_chunk_max; i++) {
-      (*this)(i);
-    }
-    if (m_other != nullptr) {
-      //printf("deallocating device memory %s\n", m_label.c_str());
+    // Destroy the linked allocate if we have one.
+    if (m_linked != nullptr) {
       MemorySpace().deallocate(
-        m_label.c_str(), m_other, (sizeof(local_value_type*) * (m_chunk_max + 2)));
+        m_label.c_str(), m_linked, (sizeof(value_type*) * (m_chunk_max + 2)));
     }
   }
 
   void destroy_shared_allocation() { execute(true); }
 
   std::string m_label;
-  local_value_type** m_chunks;
-  local_value_type** m_other = nullptr;
+  value_type** m_chunks = nullptr;
+  value_type** m_linked = nullptr;
   unsigned m_chunk_max;
   unsigned m_chunk_size;
 };
@@ -167,9 +161,7 @@ public:
   template <typename Space>
   static SmartMemoryAccessor<Space, ValueType> create_mirror(
     SmartMemoryAccessor<MemorySpace, ValueType> const& other,
-    typename std::enable_if<
-      Kokkos::Impl::MemorySpaceAccess<MemorySpace, Space>::accessible
-    >::type* = nullptr
+    typename std::enable_if<is_accessible_from<Space>>::type* = nullptr
   ) {
     return SmartMemoryAccessor<Space, ValueType>{
       ACCESSIBLE_TAG{}, other.m_chunks, other.m_chunk_max};
@@ -178,9 +170,7 @@ public:
   template <typename Space>
   static SmartMemoryAccessor<Space, ValueType> create_mirror(
     SmartMemoryAccessor<MemorySpace, ValueType> const& other,
-    typename std::enable_if<
-      not Kokkos::Impl::MemorySpaceAccess<MemorySpace, Space>::accessible
-    >::type* = nullptr
+    typename std::enable_if<not is_accessible_from<Space>>::type* = nullptr
   ) {
     using tag_type = typename SmartMemoryAccessor<Space, ValueType>::INACCESSIBLE_TAG;
     return SmartMemoryAccessor<Space, ValueType>{tag_type{}, other.m_chunk_max,
@@ -190,12 +180,9 @@ public:
 public:
   void allocate_device(const std::string& label) {
     if (m_chunks == nullptr) {
-      //printf("allocating device memory %s\n", label.c_str());
       m_chunks = reinterpret_cast<pointer_type*>(
-        MemorySpace().allocate(label.c_str(), (sizeof(pointer_type) * (m_chunk_max + 2))));
-      typename MemorySpace::execution_space().fence();
-      // m_chunks = static_cast<pointer_type*>(
-      //   kokkos_malloc<MemorySpace>(label, (sizeof(pointer_type) * (m_chunk_max + 2))));
+        MemorySpace().allocate(label.c_str(),
+                               (sizeof(pointer_type) * (m_chunk_max + 2))));
     }
   }
 
@@ -207,7 +194,9 @@ public:
   }
 
   template <typename Space>
-  void allocate(const std::string& label, pointer_type* other) {
+  void allocate_with_destroy(
+    const std::string& label, pointer_type* linked_allocation = nullptr) {
+
     using destroy_type = Destroy<Space, ValueType>;
     using record_type  = Kokkos::Impl::SharedAllocationRecord<MemorySpace, destroy_type>;
 
@@ -220,23 +209,21 @@ public:
     m_chunks = static_cast<pointer_type*>(record->data());
     m_track.assign_allocated_record_to_uninitialized(record);
 
-    record->m_destroy = destroy_type(label, m_chunks, m_chunk_max, m_chunk_size, other);
+    record->m_destroy = destroy_type(label, m_chunks, m_chunk_max,
+                                     m_chunk_size, linked_allocation);
   }
 
   pointer_type* get_ptr() const { return m_chunks; }
 
   template <typename Space>
-  typename std::enable_if<
-    not Kokkos::Impl::MemorySpaceAccess<MemorySpace, Space>::accessible
-  >::type
+  typename std::enable_if<not is_accessible_from<Space>>::type
   deep_copy_to(SmartMemoryAccessor<Space, ValueType> const& other) {
-    Kokkos::Impl::DeepCopy<Space, MemorySpace>(other.m_chunks, m_chunks, sizeof(pointer_type)*(m_chunk_max+2));
+    Kokkos::Impl::DeepCopy<Space, MemorySpace>(
+      other.m_chunks, m_chunks, sizeof(pointer_type)*(m_chunk_max+2));
   }
 
   template <typename Space>
-  typename std::enable_if<
-    Kokkos::Impl::MemorySpaceAccess<MemorySpace, Space>::accessible
-  >::type
+  typename std::enable_if<is_accessible_from<Space>>::type
   deep_copy_to(SmartMemoryAccessor<Space, ValueType> const&) {
     // no-op
   }
@@ -275,8 +262,6 @@ class DynamicView : public Kokkos::ViewTraits<DataType, P...> {
   using value_type      = typename traits::value_type;
   using device_space    = typename traits::memory_space;
   using host_space      = typename Kokkos::Impl::HostMirror<device_space>::Space::memory_space;
-//typename traits::HostMirrorSpace;
-// typename device_space::HostMirror;
   using device_accessor = Impl::SmartMemoryAccessor<device_space, value_type>;
   using host_accessor   = Impl::SmartMemoryAccessor<host_space, value_type>;
 
@@ -562,17 +547,16 @@ class DynamicView : public Kokkos::ViewTraits<DataType, P...> {
         ,
         m_chunk_size(2 << (m_chunk_shift - 1))
   {
-    //printf("m_chunk_max=%u, m_chunk_size=%u\n", m_chunk_max, m_chunk_size);
     m_chunks = device_accessor(m_chunk_max, m_chunk_size);
 
     if (m_chunks.template is_accessible_from<host_space>) {
-      m_chunks.template allocate<device_space>(arg_label, nullptr);
+      m_chunks.template allocate_with_destroy<device_space>(arg_label);
       m_chunks.initialize();
       m_chunks_host = device_accessor::template create_mirror<host_space>(m_chunks);
     } else {
       m_chunks.allocate_device(arg_label);
       m_chunks_host = device_accessor::template create_mirror<host_space>(m_chunks);
-      m_chunks_host.template allocate<device_space>(arg_label, m_chunks.get_ptr());
+      m_chunks_host.template allocate_with_destroy<device_space>(arg_label, m_chunks.get_ptr());
       m_chunks_host.initialize();
       m_chunks_host.deep_copy_to(m_chunks);
     }
